@@ -2,7 +2,7 @@ import type { Config, Endpoint, PayloadRequest } from 'payload'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 const revalidateTag = vi.fn()
-vi.mock('next/cache', () => ({ revalidateTag: (...a: unknown[]) => revalidateTag(...a) }))
+vi.mock('next/cache.js', () => ({ revalidateTag: (...a: unknown[]) => revalidateTag(...a) }))
 
 import { cacheRefreshPlugin, type CacheRefreshOptions } from '../src/index.js'
 
@@ -11,10 +11,12 @@ const admin: FakeUser = { id: 'u1', collection: 'users', email: 'admin@example.t
 const member: FakeUser = { id: 'u2', collection: 'users', email: 'member@example.test', role: 'member' }
 
 const logger = { warn: vi.fn(), error: vi.fn() }
-const reqOf = (user: FakeUser | null, body?: unknown): PayloadRequest =>
-  ({ user, payload: { logger }, json: async () => body ?? {} }) as unknown as PayloadRequest
+const sameSite = { 'content-type': 'application/json', origin: 'https://admin.example.test', 'sec-fetch-site': 'same-origin' }
+const reqOf = (user: FakeUser | null, body?: unknown, headers: Record<string, string> = sameSite): PayloadRequest =>
+  ({ user, url: 'https://admin.example.test/api/cache-refresh', headers: new Headers(headers), payload: { logger }, json: async () => body ?? {} }) as unknown as PayloadRequest
 
 const base: CacheRefreshOptions = {
+  cooldownMs: 0,
   canRefresh: (req) => (req.user as FakeUser | null)?.role === 'admin',
   tags: ['posts', 'pages', 'menu'],
 }
@@ -35,6 +37,7 @@ const call = async (h: Endpoint['handler'], req: PayloadRequest) => {
 const confirmAll = { confirm: true, scope: 'all' }
 
 beforeEach(() => {
+  vi.useRealTimers()
   revalidateTag.mockReset()
   logger.warn.mockReset()
   logger.error.mockReset()
@@ -189,6 +192,83 @@ describe('changed tags or everything', () => {
   })
 })
 
+describe('same-site check (CSRF)', () => {
+  const textPlain = { ...sameSite, 'content-type': 'text/plain' }
+  const attempts: [string, Record<string, string>, number][] = [
+    ['text/plain form post', textPlain, 415],
+    ['no content type', { origin: sameSite.origin, 'sec-fetch-site': 'same-origin' }, 415],
+    ['cross-site Sec-Fetch-Site', { ...sameSite, 'sec-fetch-site': 'cross-site' }, 403],
+    ['same-site (sibling) Sec-Fetch-Site', { ...sameSite, 'sec-fetch-site': 'same-site' }, 403],
+    ['other Origin', { 'content-type': 'application/json', origin: 'https://evil.example.test' }, 403],
+    ['Origin null', { 'content-type': 'application/json', origin: 'null' }, 403],
+    ['no Origin and no Sec-Fetch-Site', { 'content-type': 'application/json' }, 403],
+  ]
+  it.each(attempts)('refuses %s and refreshes nothing', async (_n, headers, status) => {
+    const onRefresh = vi.fn()
+    const out = await call(endpoints({ onRefresh }).post, reqOf(admin, confirmAll, headers))
+    expect(out.status).toBe(status)
+    expect(revalidateTag).not.toHaveBeenCalled()
+    expect(onRefresh).not.toHaveBeenCalled()
+  })
+  it('accepts application/json with a charset, and Origin alone', async () => {
+    const h = { 'content-type': 'application/json; charset=utf-8', origin: sameSite.origin }
+    expect((await call(endpoints().post, reqOf(admin, confirmAll, h))).status).toBe(200)
+  })
+  it('accepts Sec-Fetch-Site same-origin alone', async () => {
+    const h = { 'content-type': 'application/json', 'sec-fetch-site': 'same-origin' }
+    expect((await call(endpoints().post, reqOf(admin, confirmAll, h))).status).toBe(200)
+  })
+  it('uses allowedOrigins when given', async () => {
+    const h = { 'content-type': 'application/json', origin: 'https://other.example.test' }
+    expect((await call(endpoints({ allowedOrigins: ['https://other.example.test'] }).post, reqOf(admin, confirmAll, h))).status).toBe(200)
+    expect((await call(endpoints({ allowedOrigins: ['https://other.example.test'] }).post, reqOf(admin, confirmAll))).status).toBe(403)
+  })
+  it('uses the Payload serverURL when no allowedOrigins is given', async () => {
+    const cfg = cacheRefreshPlugin(base)({ serverURL: 'https://cms.example.test' } as unknown as Config) as Config
+    const post = cfg.endpoints!.find((e) => e.method === 'post')!.handler
+    expect((await call(post, reqOf(admin, confirmAll))).status).toBe(403)
+    const h = { 'content-type': 'application/json', origin: 'https://cms.example.test' }
+    expect((await call(post, reqOf(admin, confirmAll, h))).status).toBe(200)
+  })
+  it('still answers 401 and 403 for sign-in and rules before the site check', async () => {
+    expect((await call(endpoints().post, reqOf(null, confirmAll, textPlain))).status).toBe(401)
+    expect((await call(endpoints().post, reqOf(member, confirmAll, textPlain))).status).toBe(403)
+  })
+})
+
+describe('lock and cooldown', () => {
+  it('refuses a second press while one is running, then lets the first finish', async () => {
+    let release!: () => void
+    const gate = new Promise<void>((r) => (release = r))
+    const { post } = endpoints({ tags: async () => { await gate; return ['a'] } })
+    const first = call(post, reqOf(admin, confirmAll))
+    const second = await call(post, reqOf(admin, confirmAll))
+    expect(second.status).toBe(429)
+    release()
+    expect((await first).status).toBe(200)
+    expect(revalidateTag).toHaveBeenCalledTimes(1)
+  })
+  it('refuses a repeat inside the cooldown and allows it after', async () => {
+    vi.useFakeTimers()
+    const { post } = endpoints({ cooldownMs: 5000 })
+    expect((await call(post, reqOf(admin, confirmAll))).status).toBe(200)
+    expect((await call(post, reqOf(admin, confirmAll))).status).toBe(429)
+    vi.advanceTimersByTime(5001)
+    expect((await call(post, reqOf(admin, confirmAll))).status).toBe(200)
+  })
+  it('releases the lock when the refresh fails', async () => {
+    const { post } = endpoints({ tags: async () => { throw new Error('x') } })
+    expect((await call(post, reqOf(admin, confirmAll))).status).toBe(500)
+    expect((await call(post, reqOf(admin, confirmAll))).status).toBe(500)
+  })
+  it('does not count a refused or unconfirmed press toward the cooldown', async () => {
+    const { post } = endpoints({ cooldownMs: 60000 })
+    await call(post, reqOf(admin, {}))
+    await call(post, reqOf(admin, confirmAll, { 'content-type': 'text/plain' }))
+    expect((await call(post, reqOf(admin, confirmAll))).status).toBe(200)
+  })
+})
+
 describe('warming', () => {
   const warmOpts = { warmBaseUrl: 'https://site.example.test', warmPaths: ['/', '/about', '/news'] }
   it('fetches each path once, in order, after the refresh', async () => {
@@ -196,7 +276,7 @@ describe('warming', () => {
     vi.stubGlobal('fetch', vi.fn(async (u: URL) => { seen.push(`${revalidateTag.mock.calls.length}:${u.pathname}`); return new Response('ok') }))
     const out = await call(endpoints(warmOpts).post, reqOf(admin, confirmAll))
     expect(seen).toEqual(['3:/', '3:/about', '3:/news'])
-    expect(out.body.warmed).toEqual({ attempted: 3, failed: 0 })
+    expect(out.body.warmed).toEqual({ attempted: 3, ok: 3, failed: 0, timedOut: 0, skipped: 0, deadlineReached: false })
   })
   it('never fails the refresh: errors, timeouts and bad statuses are counted', async () => {
     let n = 0
@@ -208,7 +288,7 @@ describe('warming', () => {
     }))
     const onRefresh = vi.fn()
     const out = await call(endpoints({ ...warmOpts, onRefresh }).post, reqOf(admin, confirmAll))
-    expect(out).toMatchObject({ status: 200, body: { refreshed: true, warmed: { attempted: 3, failed: 3 } } })
+    expect(out).toMatchObject({ status: 200, body: { refreshed: true, warmed: { attempted: 3, ok: 0, failed: 2, timedOut: 1 } } })
     expect(onRefresh).toHaveBeenCalledOnce()
   })
   it('gives each fetch a timeout signal', async () => {
@@ -229,12 +309,53 @@ describe('warming', () => {
     vi.stubGlobal('fetch', f)
     const out = await call(endpoints({ ...warmOpts, warmPaths: ['https://evil.example.test/', '//evil.example.test/', '/ok'] }).post, reqOf(admin, confirmAll))
     expect(f).toHaveBeenCalledTimes(1)
-    expect(out.body.warmed).toEqual({ attempted: 1, failed: 2 })
+    expect(out.body.warmed).toMatchObject({ attempted: 1, ok: 1, failed: 2 })
   })
   it('does not warm without a base address', async () => {
     const f = vi.fn()
     vi.stubGlobal('fetch', f)
     await call(endpoints({ warmPaths: ['/'] }).post, reqOf(admin, confirmAll))
     expect(f).not.toHaveBeenCalled()
+  })
+  it.each([['/\\evil.example.test'], ['//evil.example.test'], ['/\\\\evil.example.test'], ['/ok\\x'], ['\\\\evil.example.test'], ['/\t/evil.example.test'], ['evil.example.test'], ['']])('refuses the path %j without fetching', async (bad) => {
+    const f = vi.fn(async () => new Response('ok'))
+    vi.stubGlobal('fetch', f)
+    const out = await call(endpoints({ ...warmOpts, warmPaths: [bad] }).post, reqOf(admin, confirmAll))
+    expect(f).not.toHaveBeenCalled()
+    expect(out.body.warmed).toMatchObject({ attempted: 0, failed: 1 })
+  })
+  it('only ever fetches URLs on the configured origin', async () => {
+    const seen: URL[] = []
+    vi.stubGlobal('fetch', vi.fn(async (u: URL) => { seen.push(u); return new Response('ok') }))
+    await call(endpoints({ ...warmOpts, warmBaseUrl: 'https://site.example.test/some/base', warmPaths: ['/a?x=1', '/b#h', '/c/../d'] }).post, reqOf(admin, confirmAll))
+    expect(seen).toHaveLength(3)
+    for (const u of seen) expect(u.origin).toBe('https://site.example.test')
+  })
+  it('does not warm with an invalid base address', async () => {
+    const f = vi.fn()
+    vi.stubGlobal('fetch', f)
+    const out = await call(endpoints({ warmBaseUrl: 'not a url', warmPaths: ['/'] }).post, reqOf(admin, confirmAll))
+    expect(f).not.toHaveBeenCalled()
+    expect(out.status).toBe(200)
+  })
+  it('stops at the deadline, skips the rest and says so', async () => {
+    vi.stubGlobal('fetch', vi.fn(async () => { await new Promise((r) => setTimeout(r, 60)); return new Response('ok') }))
+    const out = await call(endpoints({ ...warmOpts, warmDeadlineMs: 100, warmTimeoutMs: 1000, warmPaths: ['/1', '/2', '/3', '/4', '/5'] }).post, reqOf(admin, confirmAll))
+    expect(out.status).toBe(200)
+    expect(out.body).toMatchObject({ refreshed: true, count: 3 })
+    expect(out.body.warmed.deadlineReached).toBe(true)
+    expect(out.body.warmed.skipped).toBeGreaterThan(0)
+    expect(out.body.warmed.ok + out.body.warmed.skipped + out.body.warmed.failed + out.body.warmed.timedOut).toBe(5)
+  })
+  it('caps each fetch at the time left and counts a timeout', async () => {
+    vi.stubGlobal('fetch', vi.fn((_u: URL, init: RequestInit) => new Promise((_r, rej) => init.signal!.addEventListener('abort', () => rej(init.signal!.reason)))))
+    const out = await call(endpoints({ ...warmOpts, warmDeadlineMs: 50, warmTimeoutMs: 5000, warmPaths: ['/1', '/2'] }).post, reqOf(admin, confirmAll))
+    expect(out.body.warmed).toMatchObject({ attempted: 1, timedOut: 1, deadlineReached: true, skipped: 1 })
+  })
+  it('does not follow redirects off site', async () => {
+    const f = vi.fn(async () => new Response('ok'))
+    vi.stubGlobal('fetch', f)
+    await call(endpoints({ ...warmOpts, warmPaths: ['/'] }).post, reqOf(admin, confirmAll))
+    expect((f.mock.calls[0] as unknown as [URL, RequestInit])[1].redirect).toBe('manual')
   })
 })

@@ -15,6 +15,9 @@ export type CacheRefreshText = {
   done: (count: number) => string
   nothing: string
   warmFailed: (failed: number) => string
+  warmTimedOut: (n: number) => string
+  warmSkipped: (n: number) => string
+  busy: string
   notAudited: string
   failed: string
 }
@@ -32,6 +35,9 @@ export const defaultText: CacheRefreshText = {
   done: (n) => `Refreshed ${n} ${n === 1 ? 'tag' : 'tags'}.`,
   nothing: 'Nothing had changed, so nothing was refreshed.',
   warmFailed: (n) => `${n} ${n === 1 ? 'page' : 'pages'} could not be warmed. The refresh itself went through.`,
+  warmTimedOut: (n) => `${n} ${n === 1 ? 'page' : 'pages'} took too long to warm.`,
+  warmSkipped: (n) => `${n} ${n === 1 ? 'page was' : 'pages were'} not warmed.`,
+  busy: 'A refresh is running or just finished. Try again in a few seconds.',
   notAudited: 'The refresh went through, but the record of it could not be saved.',
   failed: 'The refresh did not happen. Nothing was changed.',
 }
@@ -95,10 +101,17 @@ export function CacheRefreshButton({ apiRoute = '/api', endpointPath = '/cache-r
     setMessage(t.working)
     try {
       const res = await fetch(url, { method: 'POST', credentials: 'include', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ confirm: true, scope: status?.hasChanged ? scope : 'all' }) })
+      if (res.status === 429) {
+        setMessage(t.busy)
+        return
+      }
       if (!res.ok) throw new Error('refused')
-      const out = (await res.json()) as { count: number; audited: boolean; warmed?: { failed: number } }
+      const out = (await res.json()) as { count: number; audited: boolean; warmed?: { failed: number; timedOut?: number; skipped?: number } }
       const parts = [out.count === 0 ? t.nothing : t.done(out.count)]
-      if (out.warmed && out.warmed.failed > 0) parts.push(t.warmFailed(out.warmed.failed))
+      const w = out.warmed
+      if (w && w.failed > 0) parts.push(t.warmFailed(w.failed))
+      if (w?.timedOut) parts.push(t.warmTimedOut(w.timedOut))
+      if (w?.skipped) parts.push(t.warmSkipped(w.skipped))
       if (out.audited === false) parts.push(t.notAudited)
       setMessage(parts.join(' '))
       setOpen(false)

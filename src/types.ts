@@ -33,7 +33,18 @@ export type RefreshReport = {
   tags: string[]
 }
 
-export type WarmResult = { attempted: number; failed: number }
+export type WarmResult = {
+  /** Fetches started. */
+  attempted: number
+  ok: number
+  /** Bad status, network error, or a path that was refused. */
+  failed: number
+  /** Fetches that hit their time limit. */
+  timedOut: number
+  /** Paths never fetched: refused, or left when the deadline passed. */
+  skipped: number
+  deadlineReached: boolean
+}
 
 export type CacheRefreshOptions = {
   /** Who may refresh. Called with the request after sign-in is checked. Throwing counts as no. Required. */
@@ -52,6 +63,12 @@ export type CacheRefreshOptions = {
   warmBaseUrl?: string
   /** Time allowed for each warming fetch, in milliseconds. Default 5000. */
   warmTimeoutMs?: number
+  /** Total time allowed for all warming, in milliseconds. Paths left when it passes are skipped. Default 15000. */
+  warmDeadlineMs?: number
+  /** Minimum time between refreshes, in milliseconds. A second press during a refresh or this wait gets 429. Default 5000. */
+  cooldownMs?: number
+  /** Origins a refresh may come from, such as `https://admin.example.org`. Default: Payload's `serverURL`, else the request's own origin. */
+  allowedOrigins?: string[]
   /** Called after a refresh with who, when and how many. A failure here is logged and reported, and never undoes the refresh. */
   onRefresh?: (report: RefreshReport) => void | Promise<void>
   /** The endpoint's path under Payload's API route. Default `/cache-refresh`. */

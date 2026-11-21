@@ -60,10 +60,21 @@ async function readBody(req: PayloadRequest): Promise<Record<string, unknown>> {
   }
 }
 
-/** Fetches each path once, in order, with a timeout. Never throws. */
+/** The path rule: one leading slash, no backslash, no control characters. Anything else could leave the site. */
+export const isSafePath = (path: unknown): path is string =>
+  typeof path === 'string' && /^\/(?![/\\])/.test(path) && !path.includes('\\') && !/[\u0000-\u001f\u007f]/.test(path)
+
+/** Fetches each path once, in order, inside one overall deadline. Never throws. */
 async function warm(req: PayloadRequest, opts: CacheRefreshOptions, tags: string[], scope: Scope): Promise<WarmResult> {
-  const result: WarmResult = { attempted: 0, failed: 0 }
+  const result: WarmResult = { attempted: 0, ok: 0, failed: 0, timedOut: 0, skipped: 0, deadlineReached: false }
   if (!opts.warmPaths || !opts.warmBaseUrl) return result
+  let origin: string
+  try {
+    origin = new URL(opts.warmBaseUrl).origin
+  } catch {
+    req.payload?.logger?.warn?.('cache-refresh: warmBaseUrl is not a valid address, so nothing was warmed.')
+    return result
+  }
   let paths: string[]
   try {
     paths = typeof opts.warmPaths === 'function' ? await opts.warmPaths({ req, tags, scope }) : opts.warmPaths
@@ -71,30 +82,74 @@ async function warm(req: PayloadRequest, opts: CacheRefreshOptions, tags: string
     req.payload?.logger?.warn?.(`cache-refresh: the warm path list failed: ${(err as Error).message}`)
     return result
   }
-  const timeout = opts.warmTimeoutMs ?? 5000
-  for (const path of Array.isArray(paths) ? paths : []) {
-    // Paths only: an absolute address could send the server's request somewhere the host never named.
-    if (typeof path !== 'string' || !path.startsWith('/') || path.startsWith('//')) {
+  const each = opts.warmTimeoutMs ?? 5000
+  const end = Date.now() + (opts.warmDeadlineMs ?? 15000)
+  const list = Array.isArray(paths) ? paths : []
+  for (const [i, path] of list.entries()) {
+    const left = end - Date.now()
+    if (left <= 0) {
+      result.deadlineReached = true
+      result.skipped += list.length - i
+      break
+    }
+    let url: URL
+    try {
+      if (!isSafePath(path)) throw new Error('not a path')
+      url = new URL(path, origin)
+      if (url.origin !== origin) throw new Error('left the site')
+    } catch {
       result.failed += 1
       continue
     }
     result.attempted += 1
     try {
-      const res = await fetch(new URL(path, opts.warmBaseUrl), { signal: AbortSignal.timeout(timeout), headers: { 'User-Agent': 'payload-plugin-cache-refresh' } })
+      const res = await fetch(url, { signal: AbortSignal.timeout(Math.min(each, left)), redirect: 'manual', headers: { 'User-Agent': 'payload-plugin-cache-refresh' } })
       await res.body?.cancel()
-      if (!res.ok) result.failed += 1
-    } catch {
-      result.failed += 1
+      if (res.ok) result.ok += 1
+      else result.failed += 1
+    } catch (err) {
+      if ((err as Error)?.name === 'TimeoutError' || (err as Error)?.name === 'AbortError') result.timedOut += 1
+      else result.failed += 1
     }
   }
   return result
 }
 
+/**
+ * CSRF: a cross-site form can send text/plain without a preflight, so the body must say it is JSON, and the
+ * browser must say the request came from this site. No evidence either way means no.
+ */
+function checkSameSite(req: PayloadRequest, allowed: string[]): void {
+  const h = req.headers
+  const type = (h?.get?.('content-type') ?? '').split(';')[0]!.trim().toLowerCase()
+  if (type !== 'application/json') return refuse('Send the request as application/json.', 415, 'contentType')
+  const fetchSite = h?.get?.('sec-fetch-site')
+  const origin = h?.get?.('origin')
+  if (fetchSite && fetchSite !== 'same-origin') return refuse('The request did not come from this site.', 403, 'crossSite')
+  if (origin) {
+    if (!allowed.includes(origin)) return refuse('The request did not come from this site.', 403, 'crossSite')
+  } else if (fetchSite !== 'same-origin') {
+    return refuse('The request did not say where it came from.', 403, 'crossSite')
+  }
+}
+
+const originOf = (u: string | undefined): string | null => {
+  try {
+    return u ? new URL(u).origin : null
+  } catch {
+    return null
+  }
+}
+
 const profileFor = (mode: RefreshMode, profile: TagProfile | undefined): TagProfile => (mode === 'expire' ? { expire: 0 } : (profile ?? 'max'))
 
-export function makeEndpoints(opts: CacheRefreshOptions): Endpoint[] {
+export function makeEndpoints(opts: CacheRefreshOptions, serverURL?: string): Endpoint[] {
   const path = opts.endpointPath ?? DEFAULT_PATH
   const mode: RefreshMode = opts.mode === 'expire' ? 'expire' : 'stale'
+  const cooldown = opts.cooldownMs ?? 5000
+  let running = false
+  let lastEnd = 0
+  const configured = (opts.allowedOrigins ?? [serverURL]).map(originOf).filter((o): o is string => Boolean(o))
 
   /** GET: what the button shows. Same guard as the refresh. */
   const status: Endpoint = {
@@ -120,37 +175,46 @@ export function makeEndpoints(opts: CacheRefreshOptions): Endpoint[] {
     method: 'post',
     handler: async (req) => {
       const who = await guard(req, opts)
+      checkSameSite(req, configured.length > 0 ? configured : [originOf(req.url)].filter((o): o is string => Boolean(o)))
       const body = await readBody(req)
       if (body.confirm !== true) return refuse('Confirm the refresh first.', 400, 'confirm')
       const scope: Scope = body.scope === 'all' || !opts.changedTags ? 'all' : 'changed'
 
-      let tags: string[]
+      if (running) return refuse('A refresh is already running.', 429, 'busy')
+      if (Date.now() - lastEnd < cooldown) return refuse('A refresh just finished. Wait a few seconds.', 429, 'cooldown')
+      running = true
       try {
-        tags = await resolveTags(req, opts, scope)
-      } catch (err) {
-        req.payload?.logger?.error?.(`cache-refresh: the tag list failed, nothing was refreshed: ${(err as Error).message}`)
-        return refuse('The list of tags could not be read, so nothing was refreshed.', 500, 'tags')
-      }
-
-      if (tags.length > 0) {
-        const { revalidateTag } = await import('next/cache')
-        const profile = profileFor(mode, opts.profile)
-        for (const tag of tags) revalidateTag(tag, profile)
-      }
-
-      const at = new Date().toISOString()
-      let audited = true
-      if (tags.length > 0 && opts.onRefresh) {
+        let tags: string[]
         try {
-          await opts.onRefresh({ who, at, count: tags.length, scope, mode, tags })
+          tags = await resolveTags(req, opts, scope)
         } catch (err) {
-          audited = false
-          req.payload?.logger?.error?.(`cache-refresh: onRefresh failed after the refresh: ${(err as Error).message}`)
+          req.payload?.logger?.error?.(`cache-refresh: the tag list failed, nothing was refreshed: ${(err as Error).message}`)
+          return refuse('The list of tags could not be read, so nothing was refreshed.', 500, 'tags')
         }
-      }
 
-      const warmed = tags.length > 0 ? await warm(req, opts, tags, scope) : { attempted: 0, failed: 0 }
-      return json({ refreshed: true, count: tags.length, scope, mode, at, audited, warmed })
+        if (tags.length > 0) {
+          const { revalidateTag } = await import('next/cache.js')
+          const profile = profileFor(mode, opts.profile)
+          for (const tag of tags) revalidateTag(tag, profile)
+        }
+
+        const at = new Date().toISOString()
+        let audited = true
+        if (tags.length > 0 && opts.onRefresh) {
+          try {
+            await opts.onRefresh({ who, at, count: tags.length, scope, mode, tags })
+          } catch (err) {
+            audited = false
+            req.payload?.logger?.error?.(`cache-refresh: onRefresh failed after the refresh: ${(err as Error).message}`)
+          }
+        }
+
+        const warmed = tags.length > 0 ? await warm(req, opts, tags, scope) : { attempted: 0, ok: 0, failed: 0, timedOut: 0, skipped: 0, deadlineReached: false }
+        return json({ refreshed: true, count: tags.length, scope, mode, at, audited, warmed })
+      } finally {
+        running = false
+        lastEnd = Date.now()
+      }
     },
   }
 
@@ -165,7 +229,7 @@ export const cacheRefreshPlugin =
     const components = incoming.admin?.components
     return {
       ...incoming,
-      endpoints: [...(incoming.endpoints ?? []), ...makeEndpoints(opts)],
+      endpoints: [...(incoming.endpoints ?? []), ...makeEndpoints(opts, incoming.serverURL)],
       admin:
         opts.adminButton === false
           ? incoming.admin
